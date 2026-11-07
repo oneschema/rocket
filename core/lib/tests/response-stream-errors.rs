@@ -65,8 +65,16 @@ impl Drop for Reader {
     }
 }
 
+struct WireResponse(Response<'static>);
+
+impl<'r> rocket::response::Responder<'r, 'static> for WireResponse {
+    fn respond_to(self, _: &'r rocket::Request<'_>) -> rocket::response::Result<'static> {
+        Ok(self.0)
+    }
+}
+
 #[rocket::get("/stream/<mode>")]
-fn response(mode: &str, control: &State<Control>) -> Response<'static> {
+fn response(mode: &str, control: &State<Control>) -> WireResponse {
     let fail = matches!(mode, "unknown" | "known" | "before");
     let wait = if fail || mode == "drain" {
         let release = control.release.clone();
@@ -88,7 +96,7 @@ fn response(mode: &str, control: &State<Control>) -> Response<'static> {
         response.raw_header("Content-Length", (BODY_LEN * 2).to_string());
     }
 
-    response.streamed_body(reader).finalize()
+    WireResponse(response.streamed_body(reader).finalize())
 }
 
 #[rocket::post("/early", data = "<_data>")]
@@ -132,14 +140,14 @@ impl Server {
     }
 
     async fn stop(&mut self) {
-        self.shutdown.notify();
+        self.shutdown.clone().notify();
         timeout(DEADLINE, &mut self.task).await.unwrap().unwrap().unwrap();
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.shutdown.notify();
+        self.shutdown.clone().notify();
         self.task.abort();
     }
 }
@@ -255,7 +263,7 @@ async fn failure_during_shutdown_does_not_become_successful_eof() {
         let mut server = Server::start().await;
         let mut response = get(&server, &client(http2), "unknown").await;
         timeout(DEADLINE, response.body_mut().data()).await.unwrap().unwrap().unwrap();
-        server.shutdown.notify();
+        server.shutdown.clone().notify();
         server.control.release.notify_one();
         assert!(timeout(DEADLINE, hyper::body::to_bytes(response)).await.unwrap().is_err());
         server.stop().await;
@@ -267,7 +275,7 @@ async fn accepted_stream_can_complete_during_shutdown() {
     for http2 in protocols() {
         let mut server = Server::start().await;
         let response = get(&server, &client(http2), "drain").await;
-        server.shutdown.notify();
+        server.shutdown.clone().notify();
         server.control.release.notify_one();
         let body = timeout(DEADLINE, hyper::body::to_bytes(response)).await.unwrap().unwrap();
         assert_eq!(body.as_ref(), vec![b'x'; BODY_LEN]);
