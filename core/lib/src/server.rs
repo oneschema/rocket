@@ -173,7 +173,14 @@ impl Rocket<Orbit> {
         let max_chunk_size = body.max_chunk_size();
         let mut stream = body.into_bytes_stream(max_chunk_size);
         while let Some(next) = stream.next().await {
-            sender.send_data(next?).await
+            let bytes = match next {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    sender.abort();
+                    return Err(error);
+                }
+            };
+            sender.send_data(bytes).await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
         }
 
