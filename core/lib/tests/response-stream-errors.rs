@@ -2,7 +2,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hyper::body::{Bytes, HttpBody};
@@ -11,19 +11,27 @@ use hyper::{Body, Client, Request};
 use rocket::fairing::AdHoc;
 use rocket::futures::{StreamExt, stream};
 use rocket::http::Status;
-use rocket::tokio::io::{AsyncRead, ReadBuf};
-use rocket::tokio::sync::{Notify, oneshot};
+use rocket::tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+#[cfg(feature = "http2")]
+use rocket::tokio::io::AsyncWriteExt;
+use rocket::tokio::sync::{Notify, Mutex, oneshot};
 use rocket::tokio::task::JoinHandle;
 use rocket::tokio::time::timeout;
 use rocket::{Config, Data, Ignite, Response, Rocket, Shutdown, State};
 
 const BODY_LEN: usize = 64 * 1024;
+const UPLOAD_PREFIX: &[u8] = b"fourteen-bytes!";
 const DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct Control {
     release: Arc<Notify>,
     dropped: Arc<Notify>,
+    entered: Arc<Notify>,
+    upload_prefix: Arc<Notify>,
+    upload_result: Arc<Mutex<Option<oneshot::Sender<io::Result<usize>>>>>,
+    upload_entered: Arc<Notify>,
+    upload_release: Arc<Notify>,
 }
 
 struct Reader {
@@ -31,6 +39,7 @@ struct Reader {
     fail: bool,
     wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     dropped: Arc<Notify>,
+    entered: Arc<Notify>,
 }
 
 impl AsyncRead for Reader {
@@ -47,7 +56,10 @@ impl AsyncRead for Reader {
         }
 
         if let Some(wait) = self.wait.as_mut() {
-            ready!(wait.as_mut().poll(cx));
+            if wait.as_mut().poll(cx).is_pending() {
+                self.entered.notify_one();
+                return Poll::Pending;
+            }
             self.wait = None;
         }
 
@@ -88,6 +100,7 @@ fn response(mode: &str, control: &State<Control>) -> WireResponse {
         fail,
         wait,
         dropped: control.dropped.clone(),
+        entered: control.entered.clone(),
     };
 
     let mut response = Response::build();
@@ -102,6 +115,27 @@ fn response(mode: &str, control: &State<Control>) -> WireResponse {
 #[rocket::post("/early", data = "<_data>")]
 fn early(_data: Data<'_>) -> (Status, &'static str) {
     (Status::UnprocessableEntity, "early rejection")
+}
+
+#[rocket::post("/upload", data = "<data>")]
+async fn upload(data: Data<'_>, control: &State<Control>) -> &'static str {
+    use rocket::data::ToByteUnit;
+
+    let mut reader = data.open(1.mebibytes());
+    let mut prefix = [0; UPLOAD_PREFIX.len()];
+    reader.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(&prefix[..], UPLOAD_PREFIX);
+    control.upload_prefix.notify_one();
+    let result = reader.read_to_end(&mut Vec::new()).await;
+    control.upload_result.lock().await.take().unwrap().send(result).unwrap();
+    "upload complete"
+}
+
+#[rocket::post("/gated-upload", data = "<data>")]
+async fn gated_upload(data: Data<'_>, control: &State<Control>) -> &'static str {
+    control.upload_entered.notify_one();
+    control.upload_release.notified().await;
+    upload(data, control).await
 }
 
 struct Server {
@@ -127,8 +161,13 @@ impl Server {
             .manage(Control {
                 release: control.release.clone(),
                 dropped: control.dropped.clone(),
+                entered: control.entered.clone(),
+                upload_prefix: control.upload_prefix.clone(),
+                upload_result: control.upload_result.clone(),
+                upload_entered: control.upload_entered.clone(),
+                upload_release: control.upload_release.clone(),
             })
-            .mount("/", rocket::routes![response, early])
+            .mount("/", rocket::routes![response, early, upload, gated_upload])
             .attach(AdHoc::on_liftoff("Bound Port", move |rocket| Box::pin(async move {
                 tx.send(rocket.config().port).unwrap();
             })))
@@ -255,6 +294,224 @@ async fn client_cancellation_releases_reader_without_stopping_server() {
         let response = get(&server, &client, "empty").await;
         assert!(hyper::body::to_bytes(response).await.unwrap().is_empty());
         server.stop().await;
+    }
+}
+
+#[cfg(feature = "http2")]
+#[rocket::async_test]
+async fn h2_cancellation_drops_stalled_reader_without_releasing_it() {
+    let mut server = Server::start().await;
+    let socket = rocket::tokio::net::TcpStream::connect(
+        server.address.trim_start_matches("http://")).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::Builder::new()
+        .http2_only(true).handshake(socket).await.unwrap();
+    let driver = rocket::tokio::spawn(connection);
+    let request = Request::get(format!("{}/stream/unknown", server.address))
+        .body(Body::empty()).unwrap();
+    let mut response = timeout(DEADLINE, sender.send_request(request)).await.unwrap().unwrap();
+    let mut observed = Vec::new();
+    while observed.len() < BODY_LEN {
+        let bytes = timeout(DEADLINE, response.body_mut().data())
+            .await.unwrap().unwrap().unwrap();
+        observed.extend_from_slice(&bytes);
+    }
+    assert_eq!(observed, vec![b'x'; BODY_LEN]);
+    timeout(DEADLINE, server.control.entered.notified()).await.unwrap();
+    drop(response);
+    timeout(DEADLINE, server.control.dropped.notified()).await.unwrap();
+
+    let request = Request::get(format!("{}/stream/empty", server.address))
+        .body(Body::empty()).unwrap();
+    let response = timeout(DEADLINE, sender.send_request(request)).await.unwrap().unwrap();
+    assert_eq!(response.status(), Status::Accepted.code);
+    assert!(timeout(DEADLINE, hyper::body::to_bytes(response)).await.unwrap().unwrap().is_empty());
+    assert!(!driver.is_finished());
+    drop(sender);
+    server.stop().await;
+    timeout(DEADLINE, driver).await.unwrap().unwrap().unwrap();
+}
+
+#[cfg(feature = "http2")]
+async fn write_h2_frame(
+    socket: &mut rocket::tokio::net::TcpStream,
+    kind: u8,
+    flags: u8,
+    stream: u32,
+    payload: &[u8],
+) {
+    let len = payload.len();
+    let id = stream.to_be_bytes();
+    let header = [
+        (len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags,
+        id[0], id[1], id[2], id[3],
+    ];
+    timeout(DEADLINE, socket.write_all(&header)).await.unwrap().unwrap();
+    timeout(DEADLINE, socket.write_all(payload)).await.unwrap().unwrap();
+}
+
+#[cfg(feature = "http2")]
+async fn open_h2_upload(server: &Server, path: &str, length: Option<usize>)
+    -> rocket::tokio::net::TcpStream
+{
+    let mut socket = rocket::tokio::net::TcpStream::connect(
+        server.address.trim_start_matches("http://")).await.unwrap();
+    socket.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await.unwrap();
+    write_h2_frame(&mut socket, 4, 0, 0, &[]).await;
+    let mut header = [0; 9];
+    timeout(DEADLINE, socket.read_exact(&mut header)).await.unwrap().unwrap();
+    assert_eq!(header[3], 4);
+    let len = ((header[0] as usize) << 16) | ((header[1] as usize) << 8)
+        | header[2] as usize;
+    timeout(DEADLINE, socket.read_exact(&mut vec![0; len])).await.unwrap().unwrap();
+    write_h2_frame(&mut socket, 4, 1, 0, &[]).await;
+
+    // HPACK: POST, http, path, localhost; no dynamic table or Huffman coding.
+    let mut headers = vec![0x83, 0x86, 0x04, path.len() as u8];
+    headers.extend_from_slice(path.as_bytes());
+    headers.extend_from_slice(&[0x01, 9]);
+    headers.extend_from_slice(b"localhost");
+    if let Some(length) = length {
+        let length = length.to_string();
+        headers.extend_from_slice(&[0, 14]);
+        headers.extend_from_slice(b"content-length");
+        headers.push(length.len() as u8);
+        headers.extend_from_slice(length.as_bytes());
+    }
+    write_h2_frame(&mut socket, 1, 4, 1, &headers).await;
+    socket
+}
+
+#[cfg(feature = "http2")]
+async fn h2_ping_barrier(socket: &mut rocket::tokio::net::TcpStream, payload: &[u8; 8]) {
+    write_h2_frame(socket, 6, 0, 0, payload).await;
+    loop {
+        let mut header = [0; 9];
+        timeout(DEADLINE, socket.read_exact(&mut header)).await.unwrap().unwrap();
+        let len = ((header[0] as usize) << 16) | ((header[1] as usize) << 8)
+            | header[2] as usize;
+        let mut body = vec![0; len];
+        timeout(DEADLINE, socket.read_exact(&mut body)).await.unwrap().unwrap();
+        if header[3] == 6 && header[4] == 1 && body == payload {
+            return;
+        }
+    }
+}
+
+#[cfg(feature = "http2")]
+#[rocket::async_test]
+async fn h2_end_stream_then_cancel_fails_pending_application_read() {
+    for known_length in [false, true] {
+        let mut server = Server::start().await;
+        let (completed, result) = oneshot::channel();
+        *server.control.upload_result.lock().await = Some(completed);
+        let length = known_length.then_some(UPLOAD_PREFIX.len());
+        let mut socket = open_h2_upload(&server, "/gated-upload", length).await;
+        write_h2_frame(&mut socket, 0, 1, 1, UPLOAD_PREFIX).await;
+        h2_ping_barrier(&mut socket, b"data-ack").await;
+        timeout(DEADLINE, server.control.upload_entered.notified()).await.unwrap();
+        write_h2_frame(&mut socket, 3, 0, 1, &8u32.to_be_bytes()).await;
+        h2_ping_barrier(&mut socket, b"rst--ack").await;
+        server.control.upload_release.notify_one();
+        let error = timeout(DEADLINE, result).await.unwrap().unwrap()
+            .expect_err("CANCEL after END_STREAM ended cleanly");
+        assert!(format!("{:?}", error).contains("CANCEL"), "{:?}", error);
+        drop(socket);
+        server.stop().await;
+    }
+}
+
+#[cfg(feature = "http2")]
+#[rocket::async_test]
+async fn h2_upload_with_trailers_completes_cleanly() {
+    for known_length in [false, true] {
+        let mut server = Server::start().await;
+        let (completed, result) = oneshot::channel();
+        *server.control.upload_result.lock().await = Some(completed);
+        let length = known_length.then_some(UPLOAD_PREFIX.len());
+        let mut socket = open_h2_upload(&server, "/upload", length).await;
+        write_h2_frame(&mut socket, 0, 0, 1, UPLOAD_PREFIX).await;
+        timeout(DEADLINE, server.control.upload_prefix.notified()).await.unwrap();
+        let trailers = b"\x00\x07x-probe\x02ok";
+        write_h2_frame(&mut socket, 1, 5, 1, trailers).await;
+        assert_eq!(timeout(DEADLINE, result).await.unwrap().unwrap().unwrap(), 0);
+        drop(socket);
+        server.stop().await;
+    }
+}
+
+#[cfg(feature = "http2")]
+#[rocket::async_test]
+async fn h2_upload_cancellation_is_error_not_eof_with_and_without_length() {
+    for known_length in [false, true] {
+        for cancel in [false, true] {
+            let mut server = Server::start().await;
+            let (completed, result) = oneshot::channel();
+            *server.control.upload_result.lock().await = Some(completed);
+            let mut socket = rocket::tokio::net::TcpStream::connect(
+                server.address.trim_start_matches("http://")).await.unwrap();
+            socket.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await.unwrap();
+            write_h2_frame(&mut socket, 4, 0, 0, &[]).await;
+            let mut header = [0; 9];
+            timeout(DEADLINE, socket.read_exact(&mut header)).await.unwrap().unwrap();
+            assert_eq!(header[3], 4);
+            let len = ((header[0] as usize) << 16) | ((header[1] as usize) << 8)
+                | header[2] as usize;
+            timeout(DEADLINE, socket.read_exact(&mut vec![0; len])).await.unwrap().unwrap();
+            write_h2_frame(&mut socket, 4, 1, 0, &[]).await;
+
+            // HPACK: POST, http, /upload, localhost; no dynamic table or Huffman coding.
+            let mut headers = vec![0x83, 0x86, 0x04, 7];
+            headers.extend_from_slice(b"/upload");
+            headers.extend_from_slice(&[0x01, 9]);
+            headers.extend_from_slice(b"localhost");
+            if known_length {
+                let length = if cancel { 100 } else { UPLOAD_PREFIX.len() };
+                let length = length.to_string();
+                headers.extend_from_slice(&[0, 14]);
+                headers.extend_from_slice(b"content-length");
+                headers.push(length.len() as u8);
+                headers.extend_from_slice(length.as_bytes());
+            }
+            write_h2_frame(&mut socket, 1, 4, 1, &headers).await;
+            write_h2_frame(&mut socket, 0, 0, 1, UPLOAD_PREFIX).await;
+            timeout(DEADLINE, server.control.upload_prefix.notified()).await.unwrap();
+            if cancel {
+                write_h2_frame(&mut socket, 3, 0, 1, &8u32.to_be_bytes()).await;
+            } else {
+                write_h2_frame(&mut socket, 0, 1, 1, &[]).await;
+            }
+            let result = timeout(DEADLINE, result).await.unwrap().unwrap();
+            if cancel {
+                let error = result.expect_err("canceled upload ended cleanly");
+                assert!(format!("{:?}", error).contains("CANCEL"), "{:?}", error);
+            } else {
+                assert_eq!(result.unwrap(), 0);
+            }
+            drop(socket);
+            server.stop().await;
+        }
+    }
+}
+
+#[rocket::async_test]
+async fn complete_uploads_still_end_cleanly() {
+    for http2 in protocols() {
+        for known_length in [false, true] {
+            let mut server = Server::start().await;
+            let (completed, result) = oneshot::channel();
+            *server.control.upload_result.lock().await = Some(completed);
+            let body = Body::wrap_stream(stream::iter([
+                Ok::<_, io::Error>(Bytes::from_static(UPLOAD_PREFIX))]));
+            let mut request = Request::post(format!("{}/upload", server.address));
+            if known_length {
+                request = request.header("Content-Length", UPLOAD_PREFIX.len().to_string());
+            }
+            let response = timeout(DEADLINE, client(http2).request(request.body(body).unwrap()))
+                .await.unwrap().unwrap();
+            assert_eq!(hyper::body::to_bytes(response).await.unwrap(), "upload complete");
+            assert_eq!(timeout(DEADLINE, result).await.unwrap().unwrap().unwrap(), 0);
+            server.stop().await;
+        }
     }
 }
 
