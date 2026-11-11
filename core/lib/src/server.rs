@@ -4,9 +4,9 @@ use std::time::Duration;
 use std::pin::Pin;
 
 use yansi::Paint;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, mpsc};
 use tokio::time::sleep;
-use futures::stream::StreamExt;
+use futures::stream::{Stream, StreamExt};
 use futures::future::{FutureExt, Future, BoxFuture};
 
 use crate::{route, Rocket, Orbit, Request, Response, Data, Config};
@@ -22,6 +22,53 @@ use crate::http::private::{TcpListener, Listener, Connection, Incoming};
 
 // A token returned to force the execution of one method before another.
 pub(crate) struct RequestToken;
+
+async fn send_body<S>(mut stream: S, sender: mpsc::Sender<io::Result<hyper::body::Bytes>>)
+    -> io::Result<()>
+    where S: Stream<Item = io::Result<hyper::body::Bytes>> + Unpin
+{
+    loop {
+        let next = tokio::select! {
+            biased;
+            next = stream.next() => next,
+            _ = sender.closed() => return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe, "client disconnect during response body")),
+        };
+        match next {
+            None => return Ok(()),
+            Some(Err(error)) => {
+                let _ = sender.send(Err(io::Error::new(error.kind(), error.to_string()))).await;
+                return Err(error);
+            }
+            Some(Ok(bytes)) => sender.send(Ok(bytes)).await
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?,
+        }
+    }
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+    use futures::stream;
+
+    #[tokio::test]
+    async fn ready_eof_wins_over_closed_consumer() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        assert!(send_body(stream::empty(), sender).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn body_error_is_delivered_as_error_not_eof() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let error = io::Error::new(io::ErrorKind::Other, "stream failed");
+        assert!(send_body(stream::iter([Err(error)]), sender).await.is_err());
+        let error = receiver.recv().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "stream failed");
+        assert!(receiver.recv().await.is_none());
+    }
+}
 
 async fn handle<Fut, T, F>(name: Option<&str>, run: F) -> Option<T>
     where F: FnOnce() -> Fut, Fut: Future<Output = T>,
@@ -158,7 +205,11 @@ impl Rocket<Orbit> {
             hyp_res = hyp_res.header(hyper::header::CONTENT_LENGTH, n);
         }
 
-        let (mut sender, hyp_body) = hyper::Body::channel();
+        let (sender, receiver) = mpsc::channel::<io::Result<hyper::body::Bytes>>(1);
+        let stream = futures::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|item| (item, receiver))
+        });
+        let hyp_body = hyper::Body::wrap_stream(stream);
         let hyp_response = hyp_res.body(hyp_body)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -171,20 +222,7 @@ impl Rocket<Orbit> {
         })?;
 
         let max_chunk_size = body.max_chunk_size();
-        let mut stream = body.into_bytes_stream(max_chunk_size);
-        while let Some(next) = stream.next().await {
-            let bytes = match next {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    sender.abort();
-                    return Err(error);
-                }
-            };
-            sender.send_data(bytes).await
-                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-        }
-
-        Ok(())
+        send_body(body.into_bytes_stream(max_chunk_size), sender).await
     }
 
     async fn handle_upgrade<'r>(

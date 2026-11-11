@@ -54,6 +54,7 @@ pub struct StreamReader<'r> {
 enum State {
     Pending,
     Partial(Cursor<hyper::body::Bytes>),
+    Trailers,
     Done,
 }
 
@@ -306,7 +307,7 @@ impl AsyncRead for StreamReader<'_> {
                     match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
                         Some(Err(e)) => return Poll::Ready(Err(e)),
                         Some(Ok(bytes)) => State::Partial(Cursor::new(bytes)),
-                        None => State::Done,
+                        None => State::Trailers,
                     }
                 },
                 State::Partial(ref mut cursor) => {
@@ -315,6 +316,13 @@ impl AsyncRead for StreamReader<'_> {
                         Ok(()) if rem == buf.remaining() => State::Pending,
                         result => return Poll::Ready(result),
                     }
+                }
+                State::Trailers => {
+                    if let StreamKind::Body(ref mut body) = self.inner {
+                        ready!(hyper::body::HttpBody::poll_trailers(Pin::new(&mut **body), cx))
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    }
+                    State::Done
                 }
                 State::Done => return Poll::Ready(Ok(())),
             }
