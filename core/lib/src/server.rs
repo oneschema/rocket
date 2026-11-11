@@ -23,6 +23,9 @@ use crate::http::private::{TcpListener, Listener, Connection, Incoming};
 // A token returned to force the execution of one method before another.
 pub(crate) struct RequestToken;
 
+/// Streams until EOF, a body error, or consumer closure without canceling detached handlers.
+/// CANCEL can fail pending reads even after a complete upload; it proves neither truncation,
+/// rollback, nor absence of side effects. Callers must not replay automatically.
 async fn send_body<S>(mut stream: S, sender: mpsc::Sender<io::Result<hyper::body::Bytes>>)
     -> io::Result<()>
     where S: Stream<Item = io::Result<hyper::body::Bytes>> + Unpin

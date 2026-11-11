@@ -318,6 +318,9 @@ impl AsyncRead for StreamReader<'_> {
                     }
                 }
                 State::Trailers => {
+                    // CANCEL can fail a pending read even after a complete upload. This does not
+                    // prove truncation, rollback, or absence of side effects; never replay
+                    // automatically. Detached handler lifetime is unchanged.
                     if let StreamKind::Body(ref mut body) = self.inner {
                         ready!(hyper::body::HttpBody::poll_trailers(Pin::new(&mut **body), cx))
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;

@@ -1,3 +1,13 @@
+# OneSchema 0.5.1 maintenance (unreleased)
+
+  * Request-body reads surface HTTP/2 CANCEL resets through the trailers API,
+    including resets received after a complete upload but before a pending read
+    finishes. Such errors do not prove truncation, rollback, or absence of side
+    effects; callers must not replay requests automatically.
+  * Response-body streaming releases stalled readers when the consumer closes,
+    retaining bounded buffering and transport errors. Detached handler lifetime
+    is unchanged; cancellation does not abort local handlers or dispatch tasks.
+
 # Version 0.5.1 (May 22, 2024)
 
 This release contains the following crate updates:

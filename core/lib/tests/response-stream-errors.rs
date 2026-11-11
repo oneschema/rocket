@@ -30,6 +30,8 @@ struct Control {
     entered: Arc<Notify>,
     upload_prefix: Arc<Notify>,
     upload_result: Arc<Mutex<Option<oneshot::Sender<io::Result<usize>>>>>,
+    upload_entered: Arc<Notify>,
+    upload_release: Arc<Notify>,
 }
 
 struct Reader {
@@ -129,6 +131,13 @@ async fn upload(data: Data<'_>, control: &State<Control>) -> &'static str {
     "upload complete"
 }
 
+#[rocket::post("/gated-upload", data = "<data>")]
+async fn gated_upload(data: Data<'_>, control: &State<Control>) -> &'static str {
+    control.upload_entered.notify_one();
+    control.upload_release.notified().await;
+    upload(data, control).await
+}
+
 struct Server {
     address: String,
     shutdown: Shutdown,
@@ -155,8 +164,10 @@ impl Server {
                 entered: control.entered.clone(),
                 upload_prefix: control.upload_prefix.clone(),
                 upload_result: control.upload_result.clone(),
+                upload_entered: control.upload_entered.clone(),
+                upload_release: control.upload_release.clone(),
             })
-            .mount("/", rocket::routes![response, early, upload])
+            .mount("/", rocket::routes![response, early, upload, gated_upload])
             .attach(AdHoc::on_liftoff("Bound Port", move |rocket| Box::pin(async move {
                 tx.send(rocket.config().port).unwrap();
             })))
@@ -336,6 +347,96 @@ async fn write_h2_frame(
     ];
     timeout(DEADLINE, socket.write_all(&header)).await.unwrap().unwrap();
     timeout(DEADLINE, socket.write_all(payload)).await.unwrap().unwrap();
+}
+
+#[cfg(feature = "http2")]
+async fn open_h2_upload(server: &Server, path: &str, length: Option<usize>)
+    -> rocket::tokio::net::TcpStream
+{
+    let mut socket = rocket::tokio::net::TcpStream::connect(
+        server.address.trim_start_matches("http://")).await.unwrap();
+    socket.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await.unwrap();
+    write_h2_frame(&mut socket, 4, 0, 0, &[]).await;
+    let mut header = [0; 9];
+    timeout(DEADLINE, socket.read_exact(&mut header)).await.unwrap().unwrap();
+    assert_eq!(header[3], 4);
+    let len = ((header[0] as usize) << 16) | ((header[1] as usize) << 8)
+        | header[2] as usize;
+    timeout(DEADLINE, socket.read_exact(&mut vec![0; len])).await.unwrap().unwrap();
+    write_h2_frame(&mut socket, 4, 1, 0, &[]).await;
+
+    // HPACK: POST, http, path, localhost; no dynamic table or Huffman coding.
+    let mut headers = vec![0x83, 0x86, 0x04, path.len() as u8];
+    headers.extend_from_slice(path.as_bytes());
+    headers.extend_from_slice(&[0x01, 9]);
+    headers.extend_from_slice(b"localhost");
+    if let Some(length) = length {
+        let length = length.to_string();
+        headers.extend_from_slice(&[0, 14]);
+        headers.extend_from_slice(b"content-length");
+        headers.push(length.len() as u8);
+        headers.extend_from_slice(length.as_bytes());
+    }
+    write_h2_frame(&mut socket, 1, 4, 1, &headers).await;
+    socket
+}
+
+#[cfg(feature = "http2")]
+async fn h2_ping_barrier(socket: &mut rocket::tokio::net::TcpStream, payload: &[u8; 8]) {
+    write_h2_frame(socket, 6, 0, 0, payload).await;
+    loop {
+        let mut header = [0; 9];
+        timeout(DEADLINE, socket.read_exact(&mut header)).await.unwrap().unwrap();
+        let len = ((header[0] as usize) << 16) | ((header[1] as usize) << 8)
+            | header[2] as usize;
+        let mut body = vec![0; len];
+        timeout(DEADLINE, socket.read_exact(&mut body)).await.unwrap().unwrap();
+        if header[3] == 6 && header[4] == 1 && body == payload {
+            return;
+        }
+    }
+}
+
+#[cfg(feature = "http2")]
+#[rocket::async_test]
+async fn h2_end_stream_then_cancel_fails_pending_application_read() {
+    for known_length in [false, true] {
+        let mut server = Server::start().await;
+        let (completed, result) = oneshot::channel();
+        *server.control.upload_result.lock().await = Some(completed);
+        let length = known_length.then_some(UPLOAD_PREFIX.len());
+        let mut socket = open_h2_upload(&server, "/gated-upload", length).await;
+        write_h2_frame(&mut socket, 0, 1, 1, UPLOAD_PREFIX).await;
+        h2_ping_barrier(&mut socket, b"data-ack").await;
+        timeout(DEADLINE, server.control.upload_entered.notified()).await.unwrap();
+        write_h2_frame(&mut socket, 3, 0, 1, &8u32.to_be_bytes()).await;
+        h2_ping_barrier(&mut socket, b"rst--ack").await;
+        server.control.upload_release.notify_one();
+        let error = timeout(DEADLINE, result).await.unwrap().unwrap()
+            .expect_err("CANCEL after END_STREAM ended cleanly");
+        assert!(format!("{:?}", error).contains("CANCEL"), "{:?}", error);
+        drop(socket);
+        server.stop().await;
+    }
+}
+
+#[cfg(feature = "http2")]
+#[rocket::async_test]
+async fn h2_upload_with_trailers_completes_cleanly() {
+    for known_length in [false, true] {
+        let mut server = Server::start().await;
+        let (completed, result) = oneshot::channel();
+        *server.control.upload_result.lock().await = Some(completed);
+        let length = known_length.then_some(UPLOAD_PREFIX.len());
+        let mut socket = open_h2_upload(&server, "/upload", length).await;
+        write_h2_frame(&mut socket, 0, 0, 1, UPLOAD_PREFIX).await;
+        timeout(DEADLINE, server.control.upload_prefix.notified()).await.unwrap();
+        let trailers = b"\x00\x07x-probe\x02ok";
+        write_h2_frame(&mut socket, 1, 5, 1, trailers).await;
+        assert_eq!(timeout(DEADLINE, result).await.unwrap().unwrap().unwrap(), 0);
+        drop(socket);
+        server.stop().await;
+    }
 }
 
 #[cfg(feature = "http2")]
