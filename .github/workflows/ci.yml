@@ -67,18 +67,24 @@ jobs:
             brew link --force --overwrite libpq
             echo "/usr/local/opt/mysql-client/bin" >> "$GITHUB_PATH"
 
-      # vcpkg --triplet x64-windows install libmysql libpq sqlite3 openssl
-      # + vcpkg/installed/vcpkg (in particular, the status file)
       - name: Install Native Dependencies (Windows)
         if: matrix.platform.name == 'Windows'
+        shell: pwsh
         run: |
-          curl -fsLS -o vcpkg.7z https://blob.rocket.rs/vcpkg-2019-07-05.7z
-          7z x vcpkg.7z -y -bb0
-          xcopy .\vcpkg $env:VCPKG_INSTALLATION_ROOT /s /e /h /y /q
-          vcpkg integrate install
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'rocket-vcpkg'
+          git clone --branch 2026.10.16 --depth 1 https://github.com/microsoft/vcpkg.git $root
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((git -C $root rev-parse HEAD) -ne '9eec002df1cd109f8f104cd966a763daf9751489') {
+            throw 'Unexpected vcpkg revision'
+          }
+          & "$root\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$root\vcpkg.exe" install libmysql libpq sqlite3 openssl --triplet x64-windows --clean-after-build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           echo "VCPKGRS_DYNAMIC=1" >> "$env:GITHUB_ENV"
-          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> "$env:GITHUB_ENV"
-          echo "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib" >> "$env:GITHUB_PATH"
+          echo "VCPKG_ROOT=$root" >> "$env:GITHUB_ENV"
+          echo "$root\installed\x64-windows\bin" >> "$env:GITHUB_PATH"
 
       - name: Install Native Dependencies (Linux)
         if: matrix.platform.name == 'Linux'

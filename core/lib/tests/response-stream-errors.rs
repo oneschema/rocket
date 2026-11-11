@@ -119,6 +119,7 @@ impl Server {
         config.address = [127, 0, 0, 1].into();
         config.log_level = rocket::config::LogLevel::Off;
         config.shutdown.ctrlc = false;
+        #[cfg(unix)]
         config.shutdown.signals.clear();
         config.shutdown.grace = 1;
         config.shutdown.mercy = 1;
