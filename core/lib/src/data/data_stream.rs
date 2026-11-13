@@ -277,11 +277,20 @@ impl Stream for StreamKind<'_> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         match self.get_mut() {
-            StreamKind::Body(body) => {
-                Pin::new(body)
-                    .poll_frame(cx)
-                    .map_ok(|frame| frame.into_data().unwrap_or_default())
-                    .map_err_ext(io::Error::other)
+            StreamKind::Body(body) => match ready!(Pin::new(&mut **body).poll_frame(cx)) {
+                Some(frame) => {
+                    Poll::Ready(Some(frame.map(|f| f.into_data().unwrap_or_default())
+                        .map_err(io::Error::other)))
+                }
+                // Hyper ends an HTTP/2 body cleanly on `RST_STREAM(NO_ERROR)`,
+                // even when fewer bytes than `Content-Length` were received.
+                None => match body.size_hint().exact() {
+                    Some(remaining @ 1..) => Poll::Ready(Some(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("request body ended {remaining} bytes before its content-length"),
+                    )))),
+                    _ => Poll::Ready(None),
+                },
             },
             StreamKind::Multipart(mp) => Pin::new(mp).poll_next(cx)
                 .map_err_ext(|e| io::Error::new(io::ErrorKind::Other, e)),
