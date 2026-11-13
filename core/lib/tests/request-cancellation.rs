@@ -27,8 +27,6 @@ type UploadResult = io::Result<Vec<u8>>;
 #[derive(Default)]
 struct Control {
     prefix_read: Notify,
-    entered: Notify,
-    release: Notify,
     result: Mutex<Option<oneshot::Sender<UploadResult>>>,
 }
 
@@ -56,13 +54,6 @@ async fn upload(data: Data<'_>, control: &State<Arc<Control>>) -> &'static str {
     "upload complete"
 }
 
-#[rocket::post("/gated-upload", data = "<data>")]
-async fn gated_upload(data: Data<'_>, control: &State<Arc<Control>>) -> &'static str {
-    control.entered.notify_one();
-    control.release.notified().await;
-    upload(data, control).await
-}
-
 struct Server {
     addr: SocketAddr,
     shutdown: Shutdown,
@@ -85,7 +76,7 @@ impl Server {
 
         let rocket = rocket::custom(config)
             .manage(control.clone())
-            .mount("/", rocket::routes![early, upload, gated_upload])
+            .mount("/", rocket::routes![early, upload])
             .attach(AdHoc::on_liftoff("Bound Port", move |rocket| Box::pin(async move {
                 tx.send(rocket.config().port).unwrap();
             })))
@@ -157,18 +148,20 @@ impl Client {
         }
 
         let request = request.body(body).unwrap();
-        let response = match self {
-            Client::Http1(client) => {
-                client.ready().await.unwrap();
-                client.send_request(request).await
-            },
-            Client::Http2(client) => {
-                client.ready().await.unwrap();
-                client.send_request(request).await
-            },
-        };
+        let response = timeout(DEADLINE, async {
+            match self {
+                Client::Http1(client) => {
+                    client.ready().await.unwrap();
+                    client.send_request(request).await
+                },
+                Client::Http2(client) => {
+                    client.ready().await.unwrap();
+                    client.send_request(request).await
+                },
+            }
+        });
 
-        timeout(DEADLINE, async { response }).await.unwrap().unwrap()
+        response.await.expect("response timed out").unwrap()
     }
 }
 
@@ -249,7 +242,6 @@ mod h2_frames {
     const HEADERS: u8 = 1;
     const RST_STREAM: u8 = 3;
     const SETTINGS: u8 = 4;
-    const PING: u8 = 6;
 
     const END_STREAM: u8 = 0x1;
     const ACK: u8 = 0x1;
@@ -259,7 +251,7 @@ mod h2_frames {
     const CANCEL: u32 = 0x8;
 
     pub async fn write_frame(socket: &mut TcpStream, kind: u8, flags: u8, payload: &[u8]) {
-        let stream: u32 = if matches!(kind, SETTINGS | PING) { 0 } else { 1 };
+        let stream: u32 = if kind == SETTINGS { 0 } else { 1 };
         let len = (payload.len() as u32).to_be_bytes();
         let id = stream.to_be_bytes();
         let header = [len[1], len[2], len[3], kind, flags, id[0], id[1], id[2], id[3]];
