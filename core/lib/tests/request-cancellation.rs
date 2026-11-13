@@ -27,6 +27,8 @@ type UploadResult = io::Result<Vec<u8>>;
 #[derive(Default)]
 struct Control {
     prefix_read: Notify,
+    entered: Notify,
+    release: Notify,
     result: Mutex<Option<oneshot::Sender<UploadResult>>>,
 }
 
@@ -54,6 +56,13 @@ async fn upload(data: Data<'_>, control: &State<Arc<Control>>) -> &'static str {
     "upload complete"
 }
 
+#[rocket::post("/gated-upload", data = "<data>")]
+async fn gated_upload(data: Data<'_>, control: &State<Arc<Control>>) -> &'static str {
+    control.entered.notify_one();
+    control.release.notified().await;
+    upload(data, control).await
+}
+
 struct Server {
     addr: SocketAddr,
     shutdown: Shutdown,
@@ -76,7 +85,7 @@ impl Server {
 
         let rocket = rocket::custom(config)
             .manage(control.clone())
-            .mount("/", rocket::routes![early, upload])
+            .mount("/", rocket::routes![early, upload, gated_upload])
             .attach(AdHoc::on_liftoff("Bound Port", move |rocket| Box::pin(async move {
                 tx.send(rocket.config().port).unwrap();
             })))
@@ -242,6 +251,7 @@ mod h2_frames {
     const HEADERS: u8 = 1;
     const RST_STREAM: u8 = 3;
     const SETTINGS: u8 = 4;
+    const PING: u8 = 6;
 
     const END_STREAM: u8 = 0x1;
     const ACK: u8 = 0x1;
@@ -251,7 +261,7 @@ mod h2_frames {
     const CANCEL: u32 = 0x8;
 
     pub async fn write_frame(socket: &mut TcpStream, kind: u8, flags: u8, payload: &[u8]) {
-        let stream: u32 = if kind == SETTINGS { 0 } else { 1 };
+        let stream: u32 = if matches!(kind, SETTINGS | PING) { 0 } else { 1 };
         let len = (payload.len() as u32).to_be_bytes();
         let id = stream.to_be_bytes();
         let header = [len[1], len[2], len[3], kind, flags, id[0], id[1], id[2], id[3]];
@@ -303,6 +313,19 @@ mod h2_frames {
 
     pub async fn cancel(socket: &mut TcpStream) {
         reset(socket, CANCEL).await;
+    }
+
+    /// Sends a PING and waits for its ACK. The server processes frames in
+    /// order, so every frame written before the PING has been received.
+    pub async fn barrier(socket: &mut TcpStream) {
+        let payload = *b"barrier!";
+        write_frame(socket, PING, 0, &payload).await;
+        loop {
+            let (kind, flags, body) = read_frame(socket).await;
+            if kind == PING && flags & ACK != 0 && body == payload {
+                return;
+            }
+        }
     }
 
     pub async fn trailers(socket: &mut TcpStream) {
@@ -368,4 +391,32 @@ async fn h2_upload_with_trailers_completes_cleanly() {
         drop(socket);
         server.stop().await;
     }
+}
+
+// h2 0.4.20 keeps a stream that received `END_STREAM` as cleanly closed even
+// after a later `RST_STREAM(CANCEL)` (`Cause::ErrorAfterEndStream`), so the
+// gated read returns the full body. Intentionally failing evidence only:
+// stricter post-completion semantics are deferred until a need is shown.
+#[cfg(feature = "http2")]
+#[rocket::async_test]
+async fn h2_cancel_after_end_stream_while_read_gated_is_error_not_eof() {
+    let mut outcomes = vec![];
+    for known_length in [false, true] {
+        let mut server = Server::start().await;
+        let result = server.expect_upload().await;
+        let length = known_length.then_some(PREFIX.len());
+        let mut socket = h2_frames::open_upload(&server, "/gated-upload", length).await;
+        h2_frames::data(&mut socket, PREFIX, true).await;
+        h2_frames::barrier(&mut socket).await;
+        timeout(DEADLINE, server.control.entered.notified()).await.unwrap();
+        h2_frames::cancel(&mut socket).await;
+        h2_frames::barrier(&mut socket).await;
+        server.control.release.notify_one();
+        outcomes.push((known_length, upload_result(result).await));
+        drop(socket);
+        server.stop().await;
+    }
+
+    let clean = outcomes.iter().filter(|(_, r)| r.is_ok()).collect::<Vec<_>>();
+    assert!(clean.is_empty(), "canceled upload ended cleanly: {clean:?}");
 }
