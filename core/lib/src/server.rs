@@ -8,7 +8,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
-use futures::stream::StreamExt;
+use futures::stream::{Stream, StreamExt};
 use futures::future::{FutureExt, Future, BoxFuture};
 use http_body_util::{Either, Empty, StreamBody};
 use hyper_util::rt::TokioIo;
@@ -39,6 +39,84 @@ type HttpBody = Either<
     Empty<Bytes>,
     StreamBody<ReceiverStream<io::Result<Frame<Bytes>>>>,
 >;
+
+/// Forwards body frames until EOF, a reader error, or closure of the consumer.
+async fn send_body<S>(mut stream: S, sender: mpsc::Sender<io::Result<Frame<Bytes>>>)
+    -> io::Result<()>
+    where S: Stream<Item = io::Result<Bytes>> + Unpin
+{
+    loop {
+        let next = tokio::select! {
+            biased;
+            next = stream.next() => next,
+            _ = sender.closed() => return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe, "client disconnect during response body")),
+        };
+        match next {
+            None => return Ok(()),
+            Some(Err(error)) => {
+                let body_error = io::Error::new(error.kind(), error.to_string());
+                let _ = sender.send(Err(body_error)).await;
+                return Err(error);
+            },
+            Some(Ok(bytes)) => sender.send(Ok(Frame::data(bytes))).await
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?,
+        }
+    }
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+    use futures::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn ready_eof_wins_over_closed_consumer() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        assert!(send_body(stream::empty(), sender).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reader_error_is_forwarded_and_preserved() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let error = io::Error::new(io::ErrorKind::InvalidData, "reader failed");
+        let result = send_body(stream::iter([Err(error)]), sender).await.unwrap_err();
+        assert_eq!(result.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(result.to_string(), "reader failed");
+        let error = receiver.recv().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), result.kind());
+        assert_eq!(error.to_string(), result.to_string());
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reader_error_wins_over_closed_consumer() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let error = io::Error::new(io::ErrorKind::InvalidData, "reader failed");
+        let result = send_body(stream::iter([Err(error)]), sender).await.unwrap_err();
+        assert_eq!(result.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(result.to_string(), "reader failed");
+    }
+
+    #[tokio::test]
+    async fn one_slot_backpressure_bounds_reader_progress() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let polled = AtomicUsize::new(0);
+        let stream = stream::iter((0..10).map(|_| Ok(Bytes::from_static(b"x"))))
+            .inspect(|_| { polled.fetch_add(1, Ordering::SeqCst); });
+        let mut body = pin!(send_body(stream, sender));
+        assert!(body.as_mut().now_or_never().is_none());
+        assert_eq!(polled.load(Ordering::SeqCst), 2);
+        assert_eq!(receiver.recv().await.unwrap().unwrap().data_ref().unwrap(), "x");
+        assert!(body.as_mut().now_or_never().is_none());
+        assert_eq!(polled.load(Ordering::SeqCst), 3);
+        drop(receiver);
+        assert_eq!(body.await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+}
 
 async fn handle<Fut, T, F>(name: Option<&str>, run: F) -> Option<T>
     where F: FnOnce() -> Fut, Fut: Future<Output = T>,
@@ -207,13 +285,7 @@ impl Rocket<Orbit> {
 
         let body = response.body_mut();
         let max_chunk_size = body.max_chunk_size();
-        let mut stream = body.into_bytes_stream(max_chunk_size);
-        while let Some(next) = stream.next().await {
-            sender.send(Ok(Frame::data(next?))).await
-                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-        }
-
-        Ok(())
+        send_body(body.into_bytes_stream(max_chunk_size), sender).await
     }
 
     async fn handle_upgrade<'r>(
