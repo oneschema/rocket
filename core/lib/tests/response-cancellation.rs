@@ -185,8 +185,14 @@ impl Client {
         let request = hyper::Request::builder().method(method)
             .uri(format!("http://localhost{path}")).body(body).unwrap();
         let response = match self {
-            Self::Http1(client) => client.send_request(request).await.unwrap(),
-            Self::Http2(client) => client.send_request(request).await.unwrap(),
+            Self::Http1(client) => {
+                client.ready().await.unwrap();
+                client.send_request(request).await.unwrap()
+            },
+            Self::Http2(client) => {
+                client.ready().await.unwrap();
+                client.send_request(request).await.unwrap()
+            },
         };
         assert_eq!(response.status(), 200);
         response
