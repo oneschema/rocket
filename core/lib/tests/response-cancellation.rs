@@ -170,8 +170,8 @@ impl Client {
     {
         let io = TokioIo::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
         if http2 {
-            let (client, connection) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-                .await.unwrap();
+            let (client, connection) =
+                hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await.unwrap();
             (Self::Http2(client), rocket::tokio::spawn(connection))
         } else {
             let (client, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
