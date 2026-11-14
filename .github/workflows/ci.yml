@@ -6,6 +6,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  current-stable-core:
+    name: Linux Core (current stable)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Sources
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-src
+
+      - name: Cache Core Workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: current-stable-core
+
+      - name: Run Core Feature Tests
+        run: ./scripts/test.sh --core -q
+
+      - name: Run Default Library and Response Stream Tests
+        run: cargo test -p rocket --lib --test response-stream-errors
+
   test:
     name: "${{ matrix.platform.name }} ${{ matrix.test.name }} (${{ matrix.platform.toolchain }})"
     runs-on: ${{ matrix.platform.distro }}
