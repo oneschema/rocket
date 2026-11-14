@@ -7,12 +7,17 @@ use std::time::Duration;
 
 use hyper::body::{Bytes, Frame, Incoming};
 use hyper::Request;
-use http_body_util::{BodyExt, Empty, StreamBody, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, StreamBody, combinators::UnsyncBoxBody};
+#[cfg(feature = "http2")]
+use http_body_util::Empty;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioExecutor;
+#[cfg(feature = "http2")]
+use hyper_util::rt::TokioIo;
 
 type Body = UnsyncBoxBody<Bytes, io::Error>;
 
+#[cfg(feature = "http2")]
 fn empty_body() -> Body {
     Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync()
 }
