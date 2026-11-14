@@ -239,7 +239,9 @@ fn client(http2: bool) -> Client<HttpConnector, Body> {
     builder.pool_max_idle_per_host(0).build_http()
 }
 
-async fn get(server: &Server, client: &Client<HttpConnector, Body>, mode: &str) -> hyper::Response<Incoming> {
+async fn get(server: &Server, client: &Client<HttpConnector, Body>, mode: &str)
+    -> hyper::Response<Incoming>
+{
     let uri = format!("{}/stream/{}", server.address, mode).parse().unwrap();
     let response = timeout(DEADLINE, client.get(uri)).await.unwrap().unwrap();
     assert_eq!(response.status(), Status::Accepted.code);
