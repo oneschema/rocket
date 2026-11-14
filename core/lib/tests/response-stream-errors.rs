@@ -425,7 +425,7 @@ async fn h2_ping_barrier(socket: &mut rocket::tokio::net::TcpStream, payload: &[
 
 #[cfg(feature = "http2")]
 #[rocket::async_test]
-async fn h2_end_stream_then_cancel_fails_pending_application_read() {
+async fn h2_end_stream_then_cancel_preserves_completed_upload() {
     for known_length in [false, true] {
         let mut server = Server::start().await;
         let (completed, result) = oneshot::channel();
@@ -438,9 +438,10 @@ async fn h2_end_stream_then_cancel_fails_pending_application_read() {
         write_h2_frame(&mut socket, 3, 0, 1, &8u32.to_be_bytes()).await;
         h2_ping_barrier(&mut socket, b"rst--ack").await;
         server.control.upload_release.notify_one();
-        let error = timeout(DEADLINE, result).await.unwrap().unwrap()
-            .expect_err("CANCEL after END_STREAM ended cleanly");
-        assert!(format!("{:?}", error).contains("CANCEL"), "{:?}", error);
+        // h2's recv_reset_preserves_received_end_stream preserves EOF after a reset.
+        assert_eq!(timeout(DEADLINE, result).await.unwrap().unwrap().unwrap(), 0);
+        let response = get(&server, &client(true), "empty").await;
+        assert!(timeout(DEADLINE, to_bytes(response)).await.unwrap().unwrap().is_empty());
         drop(socket);
         server.stop().await;
     }
