@@ -90,6 +90,7 @@ version = "1.0"
 version_check = "0.9.1"
 
 [dev-dependencies]
+hyper-util = { version = "0.1.21", features = ["client-legacy"] }
 hyper = { version = "1.12.0", default-features = false, features = ["client", "http1", "http2"] }
 figment = { version = "0.10", features = ["test"] }
 pretty_assertions = "1"
