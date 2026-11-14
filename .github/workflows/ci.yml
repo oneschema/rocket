@@ -94,7 +94,8 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         id: toolchain
         with:
-          toolchain: ${{ matrix.platform.toolchain }}
+          # SQLx 0.7.2 relies on unit never-type fallback removed in Rust 1.100.
+          toolchain: ${{ matrix.platform.toolchain == 'stable' && '1.99.1' || matrix.platform.toolchain }}
           components: rust-src
 
       - name: Cache Example Workspace
