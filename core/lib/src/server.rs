@@ -208,8 +208,24 @@ impl Rocket<Orbit> {
         let body = response.body_mut();
         let max_chunk_size = body.max_chunk_size();
         let mut stream = body.into_bytes_stream(max_chunk_size);
-        while let Some(next) = stream.next().await {
-            sender.send(Ok(Frame::data(next?))).await
+        loop {
+            let next = tokio::select! {
+                biased;
+                next = stream.next() => next,
+                _ = sender.closed() => return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe, "client disconnect during response body")),
+            };
+            let Some(next) = next else { break };
+            let bytes = match next {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let body_error = io::Error::new(error.kind(), error.to_string());
+                    let _ = sender.send(Err(body_error)).await;
+                    return Err(error);
+                }
+            };
+
+            sender.send(Ok(Frame::data(bytes))).await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
         }
 
