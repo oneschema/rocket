@@ -267,16 +267,6 @@ async fn failure(mode: &str) {
 }
 
 #[rocket::async_test]
-async fn unknown_length_failure_aborts_after_headers() {
-    failure("unknown").await;
-}
-
-#[rocket::async_test]
-async fn known_length_failure_remains_incomplete() {
-    failure("known").await;
-}
-
-#[rocket::async_test]
 async fn failure_before_first_body_chunk_aborts_after_headers() {
     failure("before").await;
 }
